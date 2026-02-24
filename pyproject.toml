@@ -1,0 +1,12 @@
+[project]
+name = "willem-playground"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "abtem>=1.0.9",
+    "cupy-cuda12x>=14.0.1",
+    "jupyterlab>=4.5.5",
+    "quantem>=0.1.8",
+]
