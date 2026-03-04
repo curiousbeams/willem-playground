@@ -1,0 +1,31 @@
+# Data files
+data/
+*.zip
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.mat
+*.nc
+
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
