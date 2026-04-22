@@ -1331,3 +1331,134 @@ def radially_project_fourier_tensor(
         array_1d = array_1d[0]
 
     return q_bins_out, array_1d
+
+from quantem.core.visualization import show_2d
+import matplotlib.pyplot as plt
+from skimage.feature import peak_local_max
+from scipy.spatial import cKDTree
+from scipy.stats import gaussian_kde
+
+def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min_distance: int = 5):
+
+    test = 250 
+
+
+    # brightfield_disk_radius = self.dset.detector_sampling[0]
+
+    # mask_radius = np.ceil(semiangle/brightfield_disk_radius) # this needs altering to update semiangle radius
+
+    mask_radius = probe_params['semiangle_cutoff']/0.8651/2
+    
+    # Get the 2D array
+    bf_disk = dataset.intensities.mean(dim=-3)
+
+    # Build a circular mask of radius mask_radius
+    H, W = bf_disk.shape[-2], bf_disk.shape[-1]
+
+    # Create coordinate grids centred at 0
+    y = torch.arange(H, device=bf_disk.device) - H // 2
+    x = torch.arange(W, device=bf_disk.device) - W // 2
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+
+    # Euclidean distance from centre
+    r = torch.sqrt(xx**2 + yy**2)
+
+    # Boolean mask: True inside the circle
+    mask = r <= mask_radius  # shape (H, W)
+    print(dataset.intensities.shape)
+    show_2d(dataset.intensities[500], title="Original Image")
+    plt.show()
+
+    intensities_masked = dataset.intensities * ~mask  # zeros inside, keeps outside
+
+    mask = r <= mask_radius  # shape (H, W)
+
+    # Apply — values outside the disk become 0 (or NaN if you prefer)
+    bf_disk_masked = bf_disk * mask
+
+    nonzero_mask = bf_disk_masked != 0
+    average = bf_disk_masked[nonzero_mask].mean()
+
+
+    template_fft = torch.fft.fft2(bf_disk_masked)
+
+    imgs_fft = torch.fft.fft2(intensities_masked)
+
+    corr = torch.fft.ifft2(imgs_fft * torch.conj(template_fft)).real
+    corr_map = corr[test]   # first element
+
+    all_disk_positions = []
+    corr = torch.fft.fftshift(corr, dim=(-2, -1))  # shift all 128 at once
+
+    all_disk_positions = []
+    for i in range(corr.shape[0]):
+        if intensities_masked[i].mean() <1:       # if the masked intensity is very low, skip peak finding to avoid noise
+            all_disk_positions.append(np.empty((0, 2)))  # no peaks
+        else:
+            corr_map = corr[i].numpy()
+            
+            peaks = peak_local_max(
+                corr_map,
+                min_distance=10,      # minimum pixel distance between peaks — tune to your disk spacing
+                num_peaks=7,          # expect 7 disks
+                threshold_rel=0.3,    # only peaks above 30% of the max — filters noise
+            )
+            # peaks is (N, 2) array of (row, col) coordinates
+            all_disk_positions.append(peaks)
+    
+    dataset.disk_positions = all_disk_positions  # list of (7, 2) arrays, one per image
+
+    
+    # Stack all positions into one big (N, 2) array
+    all_positions = np.vstack(all_disk_positions)  # (128*7, 2)
+
+    rows, cols = all_positions[:, 0], all_positions[:, 1]
+    xy = np.vstack([cols, rows])
+    kde = gaussian_kde(xy, bw_method=0.1)  # lower = sharper
+
+    # Evaluate on a grid
+    crop_size = dataset.intensities_4d.shape[-2:] # should be (192, 192)
+    xi, yi = np.mgrid[0:crop_size[0]:256j, 0:crop_size[1]:256j]
+    zi = kde(np.vstack([xi.ravel(), yi.ravel()])).reshape(crop_size)
+
+    
+
+
+    # --- 1. Find cluster centers from the KDE map ---
+    kde_peaks = peak_local_max(
+        zi.T,              # same orientation as your imshow
+        min_distance=30,   # tune to your disk spacing in the 512-grid
+        num_peaks=7,
+        threshold_rel=0.2,
+    )
+    # kde_peaks are in (row, col) on the 512x512 grid — scale back to image coords
+    scale_r = crop_size[0] / 256
+    scale_c = crop_size[1] / 256
+    kde_centers = kde_peaks * np.array([scale_r, scale_c])  # (7, 2) in image pixels
+
+    # --- 2. Build a KD-tree on the centers for fast nearest-neighbor lookup ---
+    tree = cKDTree(kde_centers)
+
+    # --- 3. Snap each raw detection to its nearest center ---
+    snapped_disk_positions = []
+    for positions in all_disk_positions:
+        if len(positions) == 0:
+            snapped_disk_positions.append(np.empty((0, 2)))
+            continue
+        _, idx = tree.query(positions)          # idx shape: (N,) — index into kde_centers
+        snapped = kde_centers[idx]              # each detection replaced by its cluster center
+        snapped = np.vstack([snapped, [128., 128.]])  # add (0,0) to every position set
+
+        snapped_disk_positions.append(snapped)
+
+    dataset.disk_positions = snapped_disk_positions
+
+    # --- 4. Visualize centers on the KDE ---
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(zi.T, origin='upper', cmap='hot', extent=[0, crop_size[0], crop_size[1], 0])
+    ax.plot(kde_centers[:, 1], kde_centers[:, 0], 'c+', markersize=15, markeredgewidth=2, label='centers')
+    ax.set_title('Disk position KDE with detected centers')
+    ax.legend()
+    plt.show()
+
+    return None                     
