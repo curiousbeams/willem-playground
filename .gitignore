@@ -29,3 +29,5 @@ Thumbs.db
 # Editor
 .vscode/
 *.swp
+
+notebooks/test_notebooks
