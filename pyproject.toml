@@ -6,7 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "abtem>=1.0.9",
+    "aimsgb>=1.1.1",
     "cupy-cuda12x>=14.0.1",
     "jupyterlab>=4.5.5",
     "quantem>=0.1.8",
 ]
+
+[tool.uv.sources]
+abtem = { git = "https://github.com/abTEM/abTEM.git" }
