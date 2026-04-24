@@ -1451,6 +1451,25 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
 
         snapped_disk_positions.append(snapped)
 
+    # --- After building snapped_disk_positions ---
+
+    max_disks = max(len(p) for p in snapped_disk_positions if len(p) > 0)
+
+    N = len(snapped_disk_positions)
+    disk_pos_tensor = torch.full((N, max_disks, 2), fill_value=-1.0)  # -1 = padding sentinel
+    disk_valid_tensor = torch.zeros(N, max_disks, dtype=torch.bool)   # True = real disk
+
+    for i, positions in enumerate(snapped_disk_positions):
+        if len(positions) == 0:
+            continue
+        pos_t = torch.from_numpy(positions.astype(np.float32))  # (n_disks, 2)
+        n = pos_t.shape[0]
+        disk_pos_tensor[i, :n] = pos_t
+        disk_valid_tensor[i, :n] = True
+
+    dataset.disk_positions = disk_pos_tensor    # (N, max_disks, 2)
+    dataset.disk_valid    = disk_valid_tensor   # (N, max_disks)  — validity mask
+
     dataset.disk_positions = snapped_disk_positions
 
     # --- 4. Visualize centers on the KDE ---
@@ -1462,3 +1481,34 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
     plt.show()
 
     return None                     
+
+def bragg_disks_to_masks(dataset, probe_params):
+    disk_radius = 20/0.8651/2                   #change to make it robust for different energy
+    bf_disk = dataset.intensities.mean(dim=-3)
+    # Build coordinate grids for the 256x256 image
+    H, W = dataset.intensities.shape[-2], dataset.intensities.shape[-1]
+    ys, xs = torch.meshgrid(torch.arange(H, device=bf_disk.device), torch.arange(W, device=bf_disk.device), indexing='ij')  # (256, 256)
+
+    # --- Precompute disk masks once ---
+    ys, xs = torch.meshgrid(
+        torch.arange(H, device=bf_disk.device),
+        torch.arange(W, device=bf_disk.device),
+        indexing='ij'
+    )
+
+    N = len(dataset.disk_positions)
+    all_masks = torch.zeros(N, H, W, dtype=torch.bool, device=bf_disk.device)
+
+    for i, positions in enumerate(dataset.disk_positions):
+        if len(positions) == 0:
+            continue
+        pos = torch.from_numpy(np.array(positions, dtype=np.float32)).to(bf_disk.device)  # (n_disks, 2)
+        y_centers = pos[:, 0]  # (n_disks,)
+        x_centers = pos[:, 1]
+
+        dist_sq = (xs.unsqueeze(0) - x_centers[:, None, None]) ** 2 \
+                + (ys.unsqueeze(0) - y_centers[:, None, None]) ** 2  # (n_disks, H, W)
+
+        all_masks[i] = (dist_sq <= disk_radius ** 2).any(dim=0)
+    dataset.disk_masks = all_masks  # (N, H, W)
+    return None
