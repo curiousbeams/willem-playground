@@ -46,6 +46,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
         _token: object | None = None,
+        wave_ground_truth: Dataset4dstem | None = None,
     ):
         AutoSerialize.__init__(self)
         OptimizerMixin.__init__(self)
@@ -632,12 +633,13 @@ class PtychographyDatasetRaster(DatasetConstraints):
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
         _token: object | None = None,
+        wave_ground_truth: Dataset4dstem | None = None, 
     ):
         self.scan_sampling = dset.sampling[:2]
         self.scan_units = dset.units[:2]
         self.gpts = dset.shape[:2]
         self.intensities_4d = dset.array.copy()
-
+        self.wave_ground_truth_4d = wave_ground_truth.array.copy() if wave_ground_truth is not None else None
         # convert to dataset3d
         shp = dset.array.shape
         dset3d = Dataset3d.from_array(
@@ -647,6 +649,16 @@ class PtychographyDatasetRaster(DatasetConstraints):
             sampling=[0, *dset.sampling[2:]],
             units=["pix", *dset.units[2:]],
         )
+        if wave_ground_truth is not None:
+            dset3d_wave_gt = Dataset3d.from_array(
+                array=self.wave_ground_truth_4d.reshape((shp[0] * shp[1], shp[2], shp[3])),
+                name=wave_ground_truth.name,
+                origin=[0, *wave_ground_truth.origin[2:]],
+                sampling=[0, *wave_ground_truth.sampling[2:]],
+                units=["pix", *wave_ground_truth.units[2:]],
+            )
+            self.wave_ground_truth_3d = dset3d_wave_gt
+
         p = Path(dset.file_path).expanduser().resolve() if dset.file_path is not None else None
         dset3d.file_path = p  # any other attributes to transfer?
 
@@ -657,7 +669,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
             _token=_token,
+            wave_ground_truth=wave_ground_truth,
         )
+
 
     # region --- classmethods ---
     @classmethod
@@ -668,6 +682,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
+        wave_ground_truth: Dataset4dstem | None = None, 
     ) -> Self:
         """
         Create a new Dataset4dstem from a Dataset4dstem.
@@ -689,6 +704,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
             _token=cls._token,
+            wave_ground_truth=wave_ground_truth,
         )
 
     @classmethod

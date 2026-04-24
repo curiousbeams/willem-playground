@@ -85,6 +85,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
         _token: None | object = None,
+        wave_ground_truth: DatasetModelType | None = None, 
     ):
         if _token is not self._token:
             raise RuntimeError("Use Dataset.from_array() to instantiate this class.")
@@ -97,6 +98,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.dset = dset
         self.device = device
         self.rng = rng
+        self.ground_truth = wave_ground_truth
 
         # initializing default attributes
         self._preprocessed: bool = False

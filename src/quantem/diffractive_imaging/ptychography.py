@@ -46,6 +46,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         device: str | int = "cpu",  # "gpu" | "cpu" | "cuda:X"
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
+        wave_ground_truth: DatasetModelType | None = None, 
     ) -> Self:
         
         
@@ -58,6 +59,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             device=device,
             verbose=verbose,
             rng=rng,
+            wave_ground_truth=wave_ground_truth,
             _token=cls._token,
         )
 
@@ -169,6 +171,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        wave_ground_truth = None
     ) -> Self:
         """
         reason for having a single reconstruct() is so that updating things like constraints
@@ -414,84 +417,72 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
     def angle_per_disk(self, fourier_overlap, disk_phase, overlap_array, batch_indices):
 
-        disk_radius = 20/0.8651/2                   #change to make it robust for different energy
-
-        # Build coordinate grids for the 256x256 image
-        H, W = fourier_overlap.shape[-2], fourier_overlap.shape[-1]
-        ys, xs = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')  # (256, 256)
-        test = 250 
-
-        # fourier_overlap shape: [1, 1225, 256, 256]
-
         masked = torch.zeros_like(fourier_overlap, device=self.device)
         masked_overlap_array = torch.zeros_like(overlap_array, device=self.device)
         fourier_modified_overlap = torch.zeros_like(overlap_array, device=self.device)
         fourier_modified_overlap_masked = torch.zeros_like(overlap_array, device=self.device)
+        
 
-        ys, xs = torch.meshgrid(
-            torch.arange(H, device=self.device),
-            torch.arange(W, device=self.device),
-            indexing='ij'
-        )
+        combined_mask = self.dset.disk_masks[batch_indices]
+        
+        if disk_phase == 'disk_phase':
 
-        for batch_idx, scan_idx in enumerate(batch_indices):
-            disk_pos = np.array(self.dset.disk_positions[scan_idx.item()])
-            combined_mask = torch.zeros(H, W, dtype=torch.bool, device=self.device) 
-            
-            if disk_phase == 'disk_phase':
+            combined_mask = torch.fft.ifftshift(combined_mask)              
+            masked[0, batch_indices] = torch.where(combined_mask, fourier_overlap[0, batch_indices], torch.zeros_like(fourier_overlap[0, batch_indices]))
 
-                for (y, x) in disk_pos:
-                    dist_sq = (xs - x) ** 2 + (ys - y) ** 2
-                    disk_mask = dist_sq <= disk_radius ** 2
-                    combined_mask |= disk_mask
-                combined_mask = torch.fft.ifftshift(combined_mask)              
-                masked[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx], torch.zeros_like(fourier_overlap[0, batch_idx]))
+            masked_overlap_array[0, batch_indices] = torch.where(combined_mask, fourier_overlap[0, batch_indices], torch.zeros_like(overlap_array[0, batch_indices]))
+            fourier_modified_overlap[0, batch_indices] = torch.where(combined_mask, torch.exp(
+                1.0j * torch.angle(fourier_overlap[0,batch_indices])), torch.zeros_like(overlap_array[0, batch_indices])
+            )
+            print(self.dset.amplitudes.shape)
+            show_2d(combined_mask[100])
+            plt.show()
+            show_2d(masked[0, 100])
+            plt.show()
+            show_2d(fourier_modified_overlap[0, 100])
+            plt.show()
+            show_2d(fourier_overlap[0, 100])
+            plt.show()
+            fourier_modified_overlap_masked[0,batch_indices] = torch.where(combined_mask, fourier_modified_overlap[0, batch_indices], torch.zeros_like(fourier_modified_overlap[0, batch_indices]))
 
-                masked_overlap_array[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx], torch.zeros_like(overlap_array[0, batch_idx]))
-                fourier_modified_overlap[0, batch_idx] = torch.exp(
-                    1.0j * torch.angle(masked[0,batch_idx])
-                ) 
-                fourier_modified_overlap_masked[0,batch_idx] = torch.where(combined_mask, fourier_modified_overlap[0, batch_idx], torch.zeros_like(fourier_modified_overlap[0, batch_idx]))
+        elif disk_phase == 'mean':
+            phase = torch.angle(fourier_overlap[0, batch_idx])
+            output = torch.zeros(H, W, device=self.device)
 
-
-            elif disk_phase == 'mean':
-                phase = torch.angle(fourier_overlap[0, batch_idx])
-                output = torch.zeros(H, W, device=self.device)
-
-                for (y, x) in disk_pos:
-                    dist_sq = (xs - x) ** 2 + (ys - y) ** 2
-                    disk_mask = dist_sq <= disk_radius ** 2
-                    mean_phase = phase[disk_mask].mean().item()  # force scalar
-                    output = torch.where(disk_mask, mean_phase, torch.zeros(H, W, device=self.device))
-                    combined_mask |= disk_mask
-                combined_mask = torch.fft.ifftshift(combined_mask)
-                masked[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx].abs() * torch.exp(1.0j * output), torch.zeros_like(fourier_overlap[0, batch_idx]))
+            for (y, x) in disk_pos:
+                dist_sq = (xs - x) ** 2 + (ys - y) ** 2
+                disk_mask = dist_sq <= disk_radius ** 2
+                mean_phase = phase[disk_mask].mean().item()  # force scalar
+                output = torch.where(disk_mask, mean_phase, torch.zeros(H, W, device=self.device))
+                combined_mask |= disk_mask
+            combined_mask = torch.fft.ifftshift(combined_mask)
+            masked[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx].abs() * torch.exp(1.0j * output), torch.zeros_like(fourier_overlap[0, batch_idx]))
 
 
 
-                masked_overlap_array[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx], torch.zeros_like(overlap_array[0, batch_idx]))
+            masked_overlap_array[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx], torch.zeros_like(overlap_array[0, batch_idx]))
 
-                fourier_modified_overlap[0, batch_idx] = torch.exp(
-                    1.0j * torch.angle(masked[0,batch_idx])
-                ) 
-                fourier_modified_overlap_masked[0,batch_idx] = torch.where(combined_mask, fourier_modified_overlap[0, batch_idx], torch.zeros_like(fourier_modified_overlap[0, batch_idx]))
+            fourier_modified_overlap[0, batch_idx] = torch.exp(
+                1.0j * torch.angle(masked[0,batch_idx])
+            ) 
+            fourier_modified_overlap_masked[0,batch_idx] = torch.where(combined_mask, fourier_modified_overlap[0, batch_idx], torch.zeros_like(fourier_modified_overlap[0, batch_idx]))
 
 
 
-            elif disk_phase == 'intensity':
-                for (x, y) in disk_pos:
-                    dist_sq = (xs - x) ** 2 + (ys - y) ** 2
-                    combined_mask |= (dist_sq <= disk_radius ** 2)
+        elif disk_phase == 'intensity':
+            for (x, y) in disk_pos:
+                dist_sq = (xs - x) ** 2 + (ys - y) ** 2
+                combined_mask |= (dist_sq <= disk_radius ** 2)
 
-                # Set pixels inside any disk to 1, outside stays 0
-                masked[0, batch_idx] = combined_mask.to(fourier_overlap.dtype)
+            # Set pixels inside any disk to 1, outside stays 0
+            masked[0, batch_idx] = combined_mask.to(fourier_overlap.dtype)
 
-            else:
-                for (x, y) in disk_pos:
-                    dist_sq = (xs - x) ** 2 + (ys - y) ** 2
-                    combined_mask |= (dist_sq < disk_radius ** 2)
+        else:
+            for (x, y) in disk_pos:
+                dist_sq = (xs - x) ** 2 + (ys - y) ** 2
+                combined_mask |= (dist_sq < disk_radius ** 2)
 
-                masked[0, batch_idx] = fourier_overlap[0, batch_idx] * combined_mask
+            masked[0, batch_idx] = fourier_overlap[0, batch_idx] * combined_mask
 
         return fourier_modified_overlap_masked, torch.fft.ifft2(masked_overlap_array)
     # endregion --- reconstruction ---
