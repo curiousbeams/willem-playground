@@ -8,6 +8,7 @@ from warnings import warn
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm.auto import tqdm
+from scipy.ndimage import shift
 
 from quantem.core import config
 from quantem.core.io.serialize import load as autoserialize_load
@@ -218,7 +219,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             val_mode=self.val_mode,
         )
         pbar = tqdm(range(num_iters), disable=not self.verbose)
-        self.dset.learn_descan = False
 
         for a0 in pbar:
             consistency_loss = 0.0
@@ -236,6 +236,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     obj_patches, shifted_probes, descan_shifts
                 )
                 pred_intensities = self.detector_model.forward(overlap)         # pred_intensities: fourier space, centered, no phase, [batch, h, w]
+                if self.a0 == 200:
+                    show_2d(torch.fft.fftshift(overlap)[0,0],title='overlap[0,0]')
+                    show_2d(torch.fft.fftshift(overlap)[0,1],title='overlap[0,1]')
+                    show_2d(torch.fft.fftshift(torch.fft.fft2(overlap))[0,1],title='fft overlap[0,1]')
+                    show_2d(pred_intensities[0],title='pred_intensities[0,0]')
+                    plt.show()
+                    self.dset.overlap = overlap
                 batch_consistency_loss, targets = self.error_estimate(           # targets: fourier space, centered, no phase, [batch, h, w]
                     pred_intensities,
                     batch_indices,
@@ -366,10 +373,17 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 patch_indices,
             )
             self.probe_model.backward(prop_gradient, obj_patches)
+            # print('object model:')
+            # print(self.obj_model._obj)
 
     def gradient_step(self, amplitudes, overlap, autograd_random, disk_phase, batch_indices):
         """Computes analytical gradient using the Fourier projection modified overlap"""
         modified_overlap, masked_overlap = self.fourier_projection(amplitudes, overlap, autograd_random, disk_phase, batch_indices)
+        # show_2d(amplitudes[0], title="Measured Amplitudes (corner-centered)", cbar=True)
+        # show_2d(torch.fft.fftshift(torch.abs(modified_overlap[0,0])), title="Modified Overlap (real space)", cbar=True)
+        # show_2d(torch.fft.fftshift(torch.abs(masked_overlap[0,0])), title="Masked Overlap (real space)", cbar=True)
+        # show_2d(torch.fft.fftshift(modified_overlap[0,0] - masked_overlap[0,0]), title="Modified Overlap - Masked Overlap", cbar=True)
+        
         return modified_overlap - masked_overlap
 
     def fourier_projection(self, measured_amplitudes, overlap_array, autograd_random, disk_phase, batch_indices):
@@ -377,7 +391,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # corner centering measured amplitudes
         measured_amplitudes = torch.fft.fftshift(measured_amplitudes, dim=(-2, -1))     # former targets: fourier space, centered->left corner, no phase, [batch, h, w] 
         fourier_overlap = torch.fft.fft2(overlap_array, norm="ortho")                   # overlap: real space->fourier space, left corner, has phase, [nprobes, batch_size, h, w]
-
+        # show_2d(measured_amplitudes[0], title="Measured Amplitudes (corner-centered)", cbar=True)
+        # plt.show()
+        # show_2d(torch.abs(torch.fft.fftshift(torch.fft.ifft2(measured_amplitudes))[0]), title="Measured Amplitudes real space", cbar=True)
+        # plt.show()
+        # show_2d(torch.abs(torch.fft.fftshift(overlap_array[0,0])), title="Overlap Array (real space)", cbar=True)
+        # plt.show()
+        # show_2d(torch.abs(torch.fft.fftshift(torch.fft.ifft2(measured_amplitudes))[0])-torch.abs(torch.fft.fftshift(overlap_array[0,0]))/200, title="Measured Amplitudes (real space) - Overlap Array (real space)", cbar=True)
+        # plt.show()
         if self.num_probes == 1:  # faster
             # in __init__ or reset_recon:
             if type(autograd_random) == float or autograd_random == 1.0+0.0j:
@@ -405,7 +426,56 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 fourier_modified_overlap = measured_amplitudes * torch.exp(
                 1.0j * torch.angle(fourier_overlap)
                 )
+                
+                if self.a0 == -1:
+                                        # Intensity patterns (magnitude only, phase lost)
+                    wave = self.dset.wave_ground_truth_4d  # shape (49, 25, 256, 256)
 
+                    # Real-space probe×object (no phase ramp, centered)
+                    wave_real_space = np.fft.fftshift(
+                        np.fft.ifft2(
+                            np.fft.ifftshift(wave, axes=(-2, -1))
+                        ),
+                        axes=(-2, -1)
+                    )  # shape (49, 25, 256, 256)
+
+                    scan_pixel_size = 40 / 48   # Å per scan step
+                    detector_pixel_size = 64 / 256  # Å per detector pixel (0.25 Å/px)
+                    ny_scan, nx_scan = 49, 25
+                    dx = 40 / 48  # Å per pixel
+                    scale = scan_pixel_size / detector_pixel_size  # = (40/48) / (64/256) ≈ 3.333 px/scan-step
+
+                    iy = (np.arange(ny_scan) - 24) * scale  # in detector pixels
+                    ix = (np.arange(nx_scan) - 12) * scale  # in detector pixels
+
+                    shifted_wave_real_space = np.empty_like(wave_real_space)
+
+                    for i in range(ny_scan):
+                        for j in range(nx_scan):
+                            shifted_wave_real_space[i, j] = shift(
+                                wave_real_space[i, j],
+                                shift=(-iy[i], -ix[j]),
+                                mode='wrap'
+                            )
+                    shp = shifted_wave_real_space.shape
+                    shifted_wave_real_space_raveled = torch.from_numpy(
+                        shifted_wave_real_space.reshape((shp[0] * shp[1], shp[2], shp[3]))
+                    )
+                    self.dset.shifted_wave_real_space_raveled = shifted_wave_real_space_raveled
+                    fourier_modified_overlap = torch.abs(self.dset.shifted_wave_real_space_raveled) * torch.exp(
+                    1.0j * torch.angle(self.dset.shifted_wave_real_space_raveled)
+                    )   
+                # if self.a0 == 0 or self.a0 == 1 or self.a0 == 2 or self.a0 == 3 or self.a0 == 4 or self.a0 == 5 or self.a0 == 10 or self.a0 == 60 or self.a0 == 100 or self.a0 == 200:
+                #     print(self.a0)
+                #     show_2d(torch.fft.fftshift(fourier_overlap[0,0]), title='Original Fourier Overlap (corner-centered, has phase)')
+                #     show_2d(torch.fft.fftshift(fourier_modified_overlap[0,0]), title='Original Fourier Overlap (corner-centered, has phase)')
+                #     show_2d(torch.fft.fftshift(torch.fft.ifft2(fourier_overlap[0,0])), title='Original Fourier Overlap (corner-centered, has phase)')
+                #     show_2d(torch.fft.fftshift(torch.fft.ifft2(fourier_modified_overlap[0,0])), title='Original Fourier Overlap (corner-centered, has phase)')
+                #     plt.show()
+                if self.a0 == 200:
+                    print(f'fourier_overlap[0,0]: {fourier_overlap[0,0][120:136, 120:136]}')
+                    print(f'fourier_ovelap magnitude[0,0]: {torch.abs(fourier_overlap[0,0][120:136, 120:136])}')
+                    print(f' fourier_ovelap phase[0,0]: {torch.angle(fourier_overlap[0,0][120:136, 120:136])}')
 
         else:  # necessary for mixed state # TODO check this with normalization
             farfield_amplitudes = self.estimate_amplitudes(overlap_array, corner_centered=True)
@@ -413,6 +483,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             amplitude_modification = measured_amplitudes / farfield_amplitudes
             fourier_modified_overlap = amplitude_modification[None] * fourier_overlap
             masked_overlap_array = overlap_array
+        # show_2d(torch.fft.ifft2(fourier_modified_overlap, norm="ortho")[0,0], title="Modified Overlap (real space)", cbar=True)
+        # show_2d(masked_overlap_array[0,0], title="Masked Overlap (real space)", cbar=True)
         return torch.fft.ifft2(fourier_modified_overlap, norm="ortho"), masked_overlap_array
 
     def angle_per_disk(self, fourier_overlap, disk_phase, overlap_array, batch_indices):
@@ -434,15 +506,15 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             fourier_modified_overlap[0, batch_indices] = torch.where(combined_mask, torch.exp(
                 1.0j * torch.angle(fourier_overlap[0,batch_indices])), torch.zeros_like(overlap_array[0, batch_indices])
             )
-            print(self.dset.amplitudes.shape)
-            show_2d(combined_mask[100])
-            plt.show()
-            show_2d(masked[0, 100])
-            plt.show()
-            show_2d(fourier_modified_overlap[0, 100])
-            plt.show()
-            show_2d(fourier_overlap[0, 100])
-            plt.show()
+            # print(self.dset.amplitudes.shape)
+            # show_2d(combined_mask[100])
+            # plt.show()
+            # show_2d(masked[0, 100])
+            # plt.show()
+            # show_2d(fourier_modified_overlap[0, 100])
+            # plt.show()
+            # show_2d(fourier_overlap[0, 100])
+            # plt.show()
             fourier_modified_overlap_masked[0,batch_indices] = torch.where(combined_mask, fourier_modified_overlap[0, batch_indices], torch.zeros_like(fourier_modified_overlap[0, batch_indices]))
 
         elif disk_phase == 'mean':

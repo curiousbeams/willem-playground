@@ -43,7 +43,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         dset: Dataset3d,
         detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
-        learn_descan: bool = True,
+        learn_descan: bool = False,
         learn_scan_positions: bool = True,
         _token: object | None = None,
         wave_ground_truth: Dataset4dstem | None = None,
@@ -630,7 +630,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         dset: Dataset4dstem,
         detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
-        learn_descan: bool = True,
+        learn_descan: bool = False,
         learn_scan_positions: bool = True,
         _token: object | None = None,
         wave_ground_truth: Dataset4dstem | None = None, 
@@ -680,7 +680,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         dset: Dataset4dstem,
         detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
-        learn_descan: bool = True,
+        learn_descan: bool = False,
         learn_scan_positions: bool = True,
         wave_ground_truth: Dataset4dstem | None = None, 
     ) -> Self:
@@ -714,7 +714,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         file_type: str,
         detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
-        learn_descan: bool = True,
+        learn_descan: bool = False,
         learn_scan_positions: bool = True,
     ) -> Self:
         """
@@ -757,7 +757,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         signal_units: str = "arb. units",
         detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
-        learn_descan: bool = True,
+        learn_descan: bool = False,
         learn_scan_positions: bool = True,
     ) -> Self:
         """

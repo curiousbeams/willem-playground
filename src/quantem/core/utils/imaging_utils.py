@@ -450,7 +450,7 @@ def get_maxima_2D(
     return peaks
 
 
-def detect_bragg_disks(
+def detect_bragg_disks2(
     dataset,
     probe,
     batch_size=256,
@@ -1338,7 +1338,7 @@ from skimage.feature import peak_local_max
 from scipy.spatial import cKDTree
 from scipy.stats import gaussian_kde
 
-def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min_distance: int = 5):
+def detect_bragg_disks(dataset, probe_params, number_peaks = 6, threshold_factor: float = 0.1, min_distance: int = 5):
 
     test = 250 
 
@@ -1347,7 +1347,7 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
 
     # mask_radius = np.ceil(semiangle/brightfield_disk_radius) # this needs altering to update semiangle radius
 
-    mask_radius = probe_params['semiangle_cutoff']/0.8651/2
+    mask_radius = probe_params['semiangle_cutoff']/2*1.1+0.0001
     
     # Get the 2D array
     bf_disk = dataset.intensities.mean(dim=-3)
@@ -1366,11 +1366,12 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
     # Boolean mask: True inside the circle
     mask = r <= mask_radius  # shape (H, W)
     print(dataset.intensities.shape)
-    show_2d(dataset.intensities[500], title="Original Image")
-    plt.show()
+    # show_2d(dataset.intensities.mean(dim=-3), title="Original Image")
+    # plt.show()
 
     intensities_masked = dataset.intensities * ~mask  # zeros inside, keeps outside
-
+    # show_2d(intensities_masked.mean(dim=-3), title="Masked Image")
+    # plt.show()
     mask = r <= mask_radius  # shape (H, W)
 
     # Apply — values outside the disk become 0 (or NaN if you prefer)
@@ -1389,24 +1390,30 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
 
     all_disk_positions = []
     corr = torch.fft.fftshift(corr, dim=(-2, -1))  # shift all 128 at once
+    if number_peaks == 0:
+        raise ValueError("number_peaks must be at least 1.")
 
     all_disk_positions = []
-    for i in range(corr.shape[0]):
-        if intensities_masked[i].mean() <1:       # if the masked intensity is very low, skip peak finding to avoid noise
-            all_disk_positions.append(np.empty((0, 2)))  # no peaks
-        else:
-            corr_map = corr[i].numpy()
-            
-            peaks = peak_local_max(
-                corr_map,
-                min_distance=10,      # minimum pixel distance between peaks — tune to your disk spacing
-                num_peaks=7,          # expect 7 disks
-                threshold_rel=0.3,    # only peaks above 30% of the max — filters noise
-            )
-            # peaks is (N, 2) array of (row, col) coordinates
-            all_disk_positions.append(peaks)
-    
-    dataset.disk_positions = all_disk_positions  # list of (7, 2) arrays, one per image
+    if number_peaks == 1:
+        all_disk_positions = [np.array([[128., 128.]])] * corr.shape[0]
+        dataset.disk_positions = all_disk_positions
+        return None  # skip KDE and snapping entirely
+    else:
+        for i in range(corr.shape[0]):
+            if intensities_masked[i].mean() < 1:
+                all_disk_positions.append(np.empty((0, 2)))
+            else:
+                corr_map = corr[i].numpy()
+                total_peaks = number_peaks-1
+                peaks = peak_local_max(
+                    corr_map,
+                    min_distance=min_distance,
+                    num_peaks=total_peaks,
+                    threshold_rel=threshold_factor,
+                )
+                all_disk_positions.append(peaks)
+
+    dataset.disk_positions = all_disk_positions
 
     
     # Stack all positions into one big (N, 2) array
@@ -1427,9 +1434,9 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
     # --- 1. Find cluster centers from the KDE map ---
     kde_peaks = peak_local_max(
         zi.T,              # same orientation as your imshow
-        min_distance=30,   # tune to your disk spacing in the 512-grid
-        num_peaks=7,
-        threshold_rel=0.2,
+        min_distance=min_distance,   # tune to your disk spacing in the 512-grid
+        num_peaks=number_peaks,
+        threshold_rel=threshold_factor,  # only peaks above threshold_factor * max
     )
     # kde_peaks are in (row, col) on the 512x512 grid — scale back to image coords
     scale_r = crop_size[0] / 256
@@ -1441,15 +1448,19 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
 
     # --- 3. Snap each raw detection to its nearest center ---
     snapped_disk_positions = []
-    for positions in all_disk_positions:
-        if len(positions) == 0:
-            snapped_disk_positions.append(np.empty((0, 2)))
-            continue
-        _, idx = tree.query(positions)          # idx shape: (N,) — index into kde_centers
-        snapped = kde_centers[idx]              # each detection replaced by its cluster center
-        snapped = np.vstack([snapped, [128., 128.]])  # add (0,0) to every position set
-
-        snapped_disk_positions.append(snapped)
+    if len(all_positions) == 0:
+        raise ValueError("No Bragg disks detected in any scan position. Check threshold_factor and min_distance.")
+    elif len(all_positions) == 1:
+        snapped_disk_positions = [np.array([[128., 128.]])] * len(all_disk_positions)
+    else:
+        for positions in all_disk_positions:
+            if len(positions) == 0:
+                snapped_disk_positions.append(np.array([[128., 128.]]))  # just center
+                continue
+            _, idx = tree.query(positions)
+            snapped = kde_centers[idx]
+            snapped = np.vstack([snapped, [128., 128.]])
+            snapped_disk_positions.append(snapped)
 
     # --- After building snapped_disk_positions ---
 
@@ -1475,7 +1486,7 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
     # --- 4. Visualize centers on the KDE ---
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(zi.T, origin='upper', cmap='hot', extent=[0, crop_size[0], crop_size[1], 0])
-    ax.plot(kde_centers[:, 1], kde_centers[:, 0], 'c+', markersize=15, markeredgewidth=2, label='centers')
+    ax.plot(snapped[:, 1], snapped[:, 0], 'c+', markersize=15, markeredgewidth=2, label='centers')
     ax.set_title('Disk position KDE with detected centers')
     ax.legend()
     plt.show()
@@ -1483,7 +1494,8 @@ def detect_bragg_disks(dataset, probe_params, threshold_factor: float = 0.1, min
     return None                     
 
 def bragg_disks_to_masks(dataset, probe_params):
-    disk_radius = 20/0.8651/2                   #change to make it robust for different energy
+    disk_radius = probe_params['semiangle_cutoff']/2*1.1+0.0001
+
     bf_disk = dataset.intensities.mean(dim=-3)
     # Build coordinate grids for the 256x256 image
     H, W = dataset.intensities.shape[-2], dataset.intensities.shape[-1]

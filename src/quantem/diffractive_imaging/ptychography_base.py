@@ -35,6 +35,9 @@ from quantem.diffractive_imaging.ptycho_utils import (
     sum_patches,
 )
 
+from quantem.core.visualization import show_2d
+import matplotlib.pyplot as plt
+
 """
 design patterns:
     - all outward facing properties ptycho.blah will give numpy arrays
@@ -922,7 +925,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
         else:
             preds = pred_intensities
-
+        # show_2d(preds[0], title='pred amplitudes' if "amplitude" in loss_type else 'pred intensities')
+        # show_2d(targets[0], title='target amplitudes' if "amplitude" in loss_type else 'target intensities')
+        # plt.show()
         diff = preds * self.dset.detector_mask - targets * self.dset.detector_mask
         if "l1" in loss_type:
             error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
