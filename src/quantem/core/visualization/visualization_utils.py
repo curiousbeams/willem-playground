@@ -273,6 +273,8 @@ def add_scalebar_to_ax(
     pad_px: float,
     color: str,
     loc: Union[str, int],
+    fontsize: float = 10,       # <-- add this
+
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -325,6 +327,7 @@ def add_scalebar_to_ax(
         frameon=False,
         label_top=loc[:3] == "low",
         size_vertical=int(width_px),  # Convert to int as required by AnchoredSizeBar
+        fontproperties={"size": fontsize},   # <-- dict works too
     )
     ax.add_artist(bar)
 

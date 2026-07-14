@@ -172,7 +172,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
-        wave_ground_truth = None
+        wave_ground_truth = None,
+        rng=None
     ) -> Self:
         """
         reason for having a single reconstruct() is so that updating things like constraints
@@ -208,16 +209,29 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         if new_scheduler:
             self.set_schedulers(self.scheduler_params, num_iter=num_iters)
-
+        
         self.dset._set_targets(loss_type)
+
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
-        batcher = SimpleBatcher(
-            self.dset.num_gpts,
-            self.batch_size,
-            rng=self.rng,
-            val_ratio=self.val_ratio,
-            val_mode=self.val_mode,
-        )
+        if rng is not None:
+            batcher = SimpleBatcher(
+                self.dset.num_gpts,
+                self.batch_size,
+                rng=rng,
+                val_ratio=self.val_ratio,
+                val_mode=self.val_mode,
+                shuffle=True
+            )
+        else:    
+            print(self.rng)
+            batcher = SimpleBatcher(
+                self.dset.num_gpts,
+                self.batch_size,
+                rng=self.rng,
+                val_ratio=self.val_ratio,
+                val_mode=self.val_mode,
+                shuffle=False
+            )
         pbar = tqdm(range(num_iters), disable=not self.verbose)
 
         for a0 in pbar:
@@ -225,24 +239,40 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             total_loss = 0.0
             self._reset_iter_constraints()
             self.a0 = a0
+            total_positions = 85 * 85
+            full_overlap = None
+            # batcher = SimpleBatcher(
+            # self.dset.num_gpts,
+            # self.batch_size,
+            # rng=a0,
+            # val_ratio=self.val_ratio,
+            # val_mode=self.val_mode,
+            # shuffle=False
+            # )
+
             for batch_indices in batcher:
+                # show_2d(self._obj_model.obj)
+                # plt.show()
                 self.zero_grad_all()
                 patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
                     self.dset.forward(batch_indices, self.obj_padding_px)
                 )
+
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
                 obj_patches = self.obj_model.forward(patch_indices)
                 propagated_probes, overlap = self.forward_operator(
                     obj_patches, shifted_probes, descan_shifts
                 )
+
+                # if self.a0 == 200 and 0 in batch_indices:
+                #     print(f"batch_indices.shape: {batch_indices.shape}")
+                #     print(f"overlap.shape: {overlap.shape}")
+                #     print(f"batch_indices[:5]: {batch_indices[:5]}")
+                #     local_idx = int((batch_indices == 0).nonzero()[0][0])
+                #     print(local_idx)
+                #     self.dset.overlap = overlap[:, local_idx:local_idx+1,:,:].detach().cpu()
+                #     print('done')
                 pred_intensities = self.detector_model.forward(overlap)         # pred_intensities: fourier space, centered, no phase, [batch, h, w]
-                if self.a0 == 200:
-                    show_2d(torch.fft.fftshift(overlap)[0,0],title='overlap[0,0]')
-                    show_2d(torch.fft.fftshift(overlap)[0,1],title='overlap[0,1]')
-                    show_2d(torch.fft.fftshift(torch.fft.fft2(overlap))[0,1],title='fft overlap[0,1]')
-                    show_2d(pred_intensities[0],title='pred_intensities[0,0]')
-                    plt.show()
-                    self.dset.overlap = overlap
                 batch_consistency_loss, targets = self.error_estimate(           # targets: fourier space, centered, no phase, [batch, h, w]
                     pred_intensities,
                     batch_indices,
@@ -267,7 +297,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 self.step_optimizers()
                 consistency_loss += batch_consistency_loss.item()
                 total_loss += batch_loss.item()
-
+            # if self.a0 == 200:
+            #     show_2d(torch.fft.fftshift(self.dset.overlap)[0,0],title='overlap[0,0]')
+            #     show_2d(pred_intensities[0],title='pred_intensities[0,0]')
+            #     plt.show()
             num_batches = len(batcher)
             total_loss = total_loss / num_batches
             consistency_loss = consistency_loss / num_batches
@@ -379,11 +412,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
     def gradient_step(self, amplitudes, overlap, autograd_random, disk_phase, batch_indices):
         """Computes analytical gradient using the Fourier projection modified overlap"""
         modified_overlap, masked_overlap = self.fourier_projection(amplitudes, overlap, autograd_random, disk_phase, batch_indices)
-        # show_2d(amplitudes[0], title="Measured Amplitudes (corner-centered)", cbar=True)
-        # show_2d(torch.fft.fftshift(torch.abs(modified_overlap[0,0])), title="Modified Overlap (real space)", cbar=True)
-        # show_2d(torch.fft.fftshift(torch.abs(masked_overlap[0,0])), title="Masked Overlap (real space)", cbar=True)
-        # show_2d(torch.fft.fftshift(modified_overlap[0,0] - masked_overlap[0,0]), title="Modified Overlap - Masked Overlap", cbar=True)
-        
         return modified_overlap - masked_overlap
 
     def fourier_projection(self, measured_amplitudes, overlap_array, autograd_random, disk_phase, batch_indices):
@@ -391,14 +419,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # corner centering measured amplitudes
         measured_amplitudes = torch.fft.fftshift(measured_amplitudes, dim=(-2, -1))     # former targets: fourier space, centered->left corner, no phase, [batch, h, w] 
         fourier_overlap = torch.fft.fft2(overlap_array, norm="ortho")                   # overlap: real space->fourier space, left corner, has phase, [nprobes, batch_size, h, w]
-        # show_2d(measured_amplitudes[0], title="Measured Amplitudes (corner-centered)", cbar=True)
-        # plt.show()
-        # show_2d(torch.abs(torch.fft.fftshift(torch.fft.ifft2(measured_amplitudes))[0]), title="Measured Amplitudes real space", cbar=True)
-        # plt.show()
-        # show_2d(torch.abs(torch.fft.fftshift(overlap_array[0,0])), title="Overlap Array (real space)", cbar=True)
-        # plt.show()
-        # show_2d(torch.abs(torch.fft.fftshift(torch.fft.ifft2(measured_amplitudes))[0])-torch.abs(torch.fft.fftshift(overlap_array[0,0]))/200, title="Measured Amplitudes (real space) - Overlap Array (real space)", cbar=True)
-        # plt.show()
+
         if self.num_probes == 1:  # faster
             # in __init__ or reset_recon:
             if type(autograd_random) == float or autograd_random == 1.0+0.0j:
@@ -465,17 +486,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     fourier_modified_overlap = torch.abs(self.dset.shifted_wave_real_space_raveled) * torch.exp(
                     1.0j * torch.angle(self.dset.shifted_wave_real_space_raveled)
                     )   
-                # if self.a0 == 0 or self.a0 == 1 or self.a0 == 2 or self.a0 == 3 or self.a0 == 4 or self.a0 == 5 or self.a0 == 10 or self.a0 == 60 or self.a0 == 100 or self.a0 == 200:
-                #     print(self.a0)
-                #     show_2d(torch.fft.fftshift(fourier_overlap[0,0]), title='Original Fourier Overlap (corner-centered, has phase)')
-                #     show_2d(torch.fft.fftshift(fourier_modified_overlap[0,0]), title='Original Fourier Overlap (corner-centered, has phase)')
-                #     show_2d(torch.fft.fftshift(torch.fft.ifft2(fourier_overlap[0,0])), title='Original Fourier Overlap (corner-centered, has phase)')
-                #     show_2d(torch.fft.fftshift(torch.fft.ifft2(fourier_modified_overlap[0,0])), title='Original Fourier Overlap (corner-centered, has phase)')
-                #     plt.show()
-                if self.a0 == 200:
-                    print(f'fourier_overlap[0,0]: {fourier_overlap[0,0][120:136, 120:136]}')
-                    print(f'fourier_ovelap magnitude[0,0]: {torch.abs(fourier_overlap[0,0][120:136, 120:136])}')
-                    print(f' fourier_ovelap phase[0,0]: {torch.angle(fourier_overlap[0,0][120:136, 120:136])}')
 
         else:  # necessary for mixed state # TODO check this with normalization
             farfield_amplitudes = self.estimate_amplitudes(overlap_array, corner_centered=True)
@@ -483,8 +493,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             amplitude_modification = measured_amplitudes / farfield_amplitudes
             fourier_modified_overlap = amplitude_modification[None] * fourier_overlap
             masked_overlap_array = overlap_array
-        # show_2d(torch.fft.ifft2(fourier_modified_overlap, norm="ortho")[0,0], title="Modified Overlap (real space)", cbar=True)
-        # show_2d(masked_overlap_array[0,0], title="Masked Overlap (real space)", cbar=True)
+
         return torch.fft.ifft2(fourier_modified_overlap, norm="ortho"), masked_overlap_array
 
     def angle_per_disk(self, fourier_overlap, disk_phase, overlap_array, batch_indices):
@@ -506,55 +515,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             fourier_modified_overlap[0, batch_indices] = torch.where(combined_mask, torch.exp(
                 1.0j * torch.angle(fourier_overlap[0,batch_indices])), torch.zeros_like(overlap_array[0, batch_indices])
             )
-            # print(self.dset.amplitudes.shape)
-            # show_2d(combined_mask[100])
-            # plt.show()
-            # show_2d(masked[0, 100])
-            # plt.show()
-            # show_2d(fourier_modified_overlap[0, 100])
-            # plt.show()
-            # show_2d(fourier_overlap[0, 100])
-            # plt.show()
+
             fourier_modified_overlap_masked[0,batch_indices] = torch.where(combined_mask, fourier_modified_overlap[0, batch_indices], torch.zeros_like(fourier_modified_overlap[0, batch_indices]))
-
-        elif disk_phase == 'mean':
-            phase = torch.angle(fourier_overlap[0, batch_idx])
-            output = torch.zeros(H, W, device=self.device)
-
-            for (y, x) in disk_pos:
-                dist_sq = (xs - x) ** 2 + (ys - y) ** 2
-                disk_mask = dist_sq <= disk_radius ** 2
-                mean_phase = phase[disk_mask].mean().item()  # force scalar
-                output = torch.where(disk_mask, mean_phase, torch.zeros(H, W, device=self.device))
-                combined_mask |= disk_mask
-            combined_mask = torch.fft.ifftshift(combined_mask)
-            masked[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx].abs() * torch.exp(1.0j * output), torch.zeros_like(fourier_overlap[0, batch_idx]))
-
-
-
-            masked_overlap_array[0, batch_idx] = torch.where(combined_mask, fourier_overlap[0, batch_idx], torch.zeros_like(overlap_array[0, batch_idx]))
-
-            fourier_modified_overlap[0, batch_idx] = torch.exp(
-                1.0j * torch.angle(masked[0,batch_idx])
-            ) 
-            fourier_modified_overlap_masked[0,batch_idx] = torch.where(combined_mask, fourier_modified_overlap[0, batch_idx], torch.zeros_like(fourier_modified_overlap[0, batch_idx]))
-
-
-
-        elif disk_phase == 'intensity':
-            for (x, y) in disk_pos:
-                dist_sq = (xs - x) ** 2 + (ys - y) ** 2
-                combined_mask |= (dist_sq <= disk_radius ** 2)
-
-            # Set pixels inside any disk to 1, outside stays 0
-            masked[0, batch_idx] = combined_mask.to(fourier_overlap.dtype)
-
-        else:
-            for (x, y) in disk_pos:
-                dist_sq = (xs - x) ** 2 + (ys - y) ** 2
-                combined_mask |= (dist_sq < disk_radius ** 2)
-
-            masked[0, batch_idx] = fourier_overlap[0, batch_idx] * combined_mask
 
         return fourier_modified_overlap_masked, torch.fft.ifft2(masked_overlap_array)
     # endregion --- reconstruction ---
