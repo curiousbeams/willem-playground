@@ -10,6 +10,16 @@ data/
 
 logs/
 
+reconstruction_*
+xcorr_*
+loss_landscape_*
+shift_*
+# Ignore all shifts_ folders/files
+**/shifts_*
+# Exception: keep anything named shifts_ inside help_steph
+!**/help_steph/**/shifts_*
+
+
 # Jupyter
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
