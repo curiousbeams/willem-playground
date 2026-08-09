@@ -126,6 +126,7 @@ class Sample:
     d_min: float  # spacing of the first allowed ZOLZ reflection, Angstrom
     unit_name: str
     basis_fn: object = field(repr=False)
+    band: int = 0  # which particle band of the reconstruction image, top to bottom
 
     @property
     def alpha_critical(self) -> float:
@@ -147,7 +148,7 @@ SAMPLES = {
         two_particles=False,
         d=10,
         d_min=_A / np.sqrt(8),  # {220}
-        unit_name=r"$d_{\mathrm{nn}} = a/\sqrt{2}$",
+        unit_name=r"$d_{220}$",
         basis_fn=hexagonal_basis,
     ),
     "two_upper": Sample(
@@ -158,8 +159,9 @@ SAMPLES = {
         two_particles=True,
         d=20,
         d_min=_A / np.sqrt(8),  # {220}
-        unit_name=r"$d_{\mathrm{nn}} = a/\sqrt{2}$",
+        unit_name=r"$d_{220}$",
         basis_fn=hexagonal_basis,
+        band=0,
     ),
     "two_lower": Sample(
         key="two_lower",
@@ -169,8 +171,9 @@ SAMPLES = {
         two_particles=True,
         d=20,
         d_min=_A / 2,  # {200}
-        unit_name=r"$d_{\mathrm{nn}} = a/2$",
+        unit_name=r"$d_{200}$",
         basis_fn=square_basis,
+        band=1,
     ),
 }
 
@@ -264,12 +267,13 @@ def calibrate_offset(sample: Sample, on_aC: bool = False, tol: float = 0.05, **k
 
 
 def fit_cell_scale(sample: Sample, on_aC: bool = False, angles=(1.5, 3), **kw) -> float:
-    """Pixels per nearest-column spacing, fit against the fully non-unique runs.
+    """Pixels per cell, fit against the fully non-unique runs.
 
     Under the null the median radius is a fixed fraction of the cell size, so
-    matching the observed median fixes the scale.  Used instead of the magic
-    ``4.2`` in the old notebooks, which drifts (4.0 / 4.18 / 4.2) between cells
-    and cannot be right for both fields of view.
+    matching the observed median fixes the scale. Kept as a cross-check on
+    :func:`measure_cell_scale`, not as the primary estimate: where the raw
+    shifts are comparable to the cell the match has more than one solution, and
+    for the two-particle runs it converges on the wrong one.
     """
     offset, _ = calibrate_offset(sample, on_aC, **kw)
     radii = []
@@ -281,34 +285,96 @@ def fit_cell_scale(sample: Sample, on_aC: bool = False, angles=(1.5, 3), **kw) -
     return float(observed / null_median)
 
 
-def estimate_cell_scale_from_png(png_path: str, object_gpts: int = 256) -> float:
-    """Independent scale estimate: lattice period read off a reconstruction PNG.
+OBJECT_GPTS = 256  # the reconstructions are 256 x 256 objects
 
-    Does not assume anything about uniqueness, unlike :func:`fit_cell_scale`.
-    The PNG is a rendered figure, so the image area is located first and the
-    measured period is converted back to object pixels.
 
-    Only meaningful when the field of view holds a single lattice -- for the
-    two-particle images the strongest peak mixes both orientations.
+def load_object_image(png_path: str, gpts: int = OBJECT_GPTS) -> np.ndarray:
+    """Recover the object array from a saved reconstruction figure.
+
+    Only rendered PNGs were kept, not the arrays. The figure is cropped to its
+    image area and resampled back onto the object grid, which puts every run --
+    whatever its colorbar width or dpi -- on one common pixel grid. Two 12 mrad
+    seeds recovered this way agree to 0.02 px, which bounds the error this adds.
     """
     from PIL import Image
 
-    rgba = np.asarray(Image.open(png_path).convert("L"), dtype=float)
-    mask = rgba < 250
-    rows, cols = np.where(mask.any(axis=1))[0], np.where(mask.any(axis=0))[0]
-    img = rgba[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
-    img = img[:, : img.shape[1] * 8 // 10]  # drop the colorbar strip
-    img = img - img.mean()
+    gray = np.asarray(Image.open(png_path).convert("L"), dtype=float)
+    ink = gray < 250
 
-    power = np.abs(np.fft.fftshift(np.fft.fft2(img * np.hanning(img.shape[0])[:, None]
-                                               * np.hanning(img.shape[1])[None, :]))) ** 2
-    cy, cx = np.array(power.shape) // 2
-    ky, kx = np.mgrid[: power.shape[0], : power.shape[1]]
-    radius = np.hypot(ky - cy, kx - cx)
-    power[radius < 8] = 0
-    peak = np.unravel_index(np.argmax(power), power.shape)
-    period_render_px = power.shape[0] / radius[peak]
-    return period_render_px * object_gpts / img.shape[0]
+    def widest_run(profile, threshold=0.5):
+        """Longest stretch of mostly-ink lines -- the image area, not the colorbar."""
+        runs, start = [], None
+        for i, filled in enumerate(profile > threshold):
+            if filled and start is None:
+                start = i
+            if not filled and start is not None:
+                runs.append((start, i - 1))
+                start = None
+        if start is not None:
+            runs.append((start, len(profile) - 1))
+        return max(runs, key=lambda r: r[1] - r[0])
+
+    r0, r1 = widest_run(ink.mean(axis=1))
+    c0, c1 = widest_run(ink.mean(axis=0))
+    crop = Image.fromarray(gray[r0 : r1 + 1, c0 : c1 + 1])
+    return np.asarray(crop.resize((gpts, gpts), Image.BICUBIC), dtype=float)
+
+
+def particle_bands(img: np.ndarray, threshold: float = 0.2, min_height: int = 20):
+    """Row ranges occupied by each particle, top to bottom, from lattice contrast."""
+    contrast = img.std(axis=1)
+    contrast = (contrast - contrast.min()) / np.ptp(contrast)
+    rows = np.where(contrast > threshold)[0]
+    splits = np.where(np.diff(rows) > 5)[0]
+    edges = np.split(rows, splits + 1)
+    return [(int(e[0]), int(e[-1])) for e in edges if e[-1] - e[0] >= min_height]
+
+
+def dominant_period(window: np.ndarray, pad: int = 1024,
+                    period_range=(2.2, 12.0)) -> float:
+    """Spacing of the strongest lattice fringes, in object pixels."""
+    w = window - window.mean()
+    w = w * np.hanning(w.shape[0])[:, None] * np.hanning(w.shape[1])[None, :]
+    power = np.abs(np.fft.fftshift(np.fft.fft2(w, s=(pad, pad)))) ** 2
+    c = pad // 2
+    ky, kx = np.mgrid[:pad, :pad]
+    radius = np.hypot(ky - c, kx - c)
+    power[(radius < pad / period_range[1]) | (radius > pad / period_range[0])] = 0
+    return float(pad / radius[np.unravel_index(np.argmax(power), power.shape)])
+
+
+def measure_cell_scale(sample: Sample, on_aC: bool = False, half: int = 28, **kw) -> float:
+    """Pixels per ambiguity cell, measured from a reconstruction image.
+
+    The cell is the period of the strongest projected fringes, which turns out
+    to be the spacing of the first allowed ZOLZ reflection -- the same
+    reflection that sets ``alpha_critical``. Unlike :func:`fit_cell_scale` this
+    assumes nothing about the shift distribution, and it is stable to ~0.3%
+    across every saved image of a given particle.
+    """
+    import glob
+
+    # the cell is a property of the particle, not of the substrate or the dose,
+    # so fall back to any run of the same sample that did save an image
+    variants = [(on_aC, kw.get("dose", DEFAULTS["dose"])), (not on_aC, kw.get("dose", DEFAULTS["dose"])),
+                (on_aC, 1e6), (not on_aC, 1e6)]
+    pngs = []
+    for aC, dose in variants:
+        opts = {**kw, "dose": dose}
+        pngs = [p for angle in CONVERGENCE_ANGLES
+                for p in sorted(glob.glob(f"{run_dir(sample, angle, aC, **opts)}/reconstruction_*.png"))]
+        if pngs:
+            break
+    if not pngs:
+        raise FileNotFoundError(f"no reconstruction image saved for {sample.key}")
+
+    img = load_object_image(pngs[0])
+    bands = particle_bands(img)
+    lo, hi = bands[min(sample.band, len(bands) - 1)]
+    cy = (lo + hi) // 2
+    h = min(half, (hi - lo) // 2)
+    mid = img.shape[1] // 2
+    return dominant_period(img[cy - h : cy + h, mid - 30 : mid + 30])
 
 
 # --- derived quantities and statistics --------------------------------------
@@ -325,6 +391,7 @@ def add_derived(df: pd.DataFrame, sample: Sample, offset, scale: float) -> pd.Da
     out["dx"] = folded[:, 0] / scale
     out["dy"] = folded[:, 1] / scale
     out["r"] = np.hypot(out["dx"], out["dy"])
+    out["r_px"] = out["r"] * scale
     out["theta_deg"] = np.degrees(np.arctan2(out["dy"], out["dx"]))
     return out
 
@@ -344,7 +411,16 @@ def rayleigh_test(theta_deg, r=None, r_min: float = 0.05):
     return n, z, float(np.clip(p, 0, 1))
 
 
-def summarize(df: pd.DataFrame, sample: Sample, unique_below: float = 0.05) -> dict:
+# A reconstruction counts as unique when its shift falls below the registration
+# noise floor: the 12 mrad seeds scatter by < 0.02 object px, and images
+# recovered from two different figures agree to 0.02 px, so 0.1 px is ~5x the
+# floor. Only the [100] particle at 6 mrad and the 12 mrad runs clear it -- the
+# [111] runs have no cluster at zero at all, just a continuum, so any looser
+# threshold reports a "unique fraction" that is an artefact of where it is set.
+UNIQUE_BELOW_PX = 0.1
+
+
+def summarize(df: pd.DataFrame, sample: Sample, unique_below_px: float = UNIQUE_BELOW_PX) -> dict:
     """One row of the summary table for a single run."""
     r = df["r"].to_numpy()
     n_dir, z, p = rayleigh_test(df["theta_deg"], r)
@@ -357,8 +433,9 @@ def summarize(df: pd.DataFrame, sample: Sample, unique_below: float = 0.05) -> d
         "conv_angle": float(df["conv_angle"].iloc[0]),
         "N": len(r),
         "median_r": float(np.median(r)),
+        "median_r_px": float(np.median(df["r_px"])),
         "p90_r": float(np.percentile(r, 90)),
-        "unique_frac": float((r < unique_below).mean()),
+        "unique_frac": float((df["r_px"] < unique_below_px).mean()),
         "wrapped_frac": float(df["wrapped"].mean()),
         "rayleigh_n": n_dir,
         "rayleigh_p": p,
@@ -371,7 +448,7 @@ def build(sample: Sample, on_aC: bool = False, angles=None, scale=None, **kw):
     angles = CONVERGENCE_ANGLES if angles is None else angles
     offset, _ = calibrate_offset(sample, on_aC, **kw)
     if scale is None:
-        scale = fit_cell_scale(sample, on_aC, **kw)
+        scale = measure_cell_scale(sample, on_aC, **kw)
     runs = {}
     for angle in angles:
         try:
@@ -413,7 +490,8 @@ def _blank_panel(ax, verts):
             fontsize=8, color="#b9b8b4")
 
 
-def plot_cell_scatter(ax, df, sample: Sample, color: str, unique_below: float = 0.05,
+def plot_cell_scatter(ax, df, sample: Sample, color: str,
+                      unique_below_px: float = UNIQUE_BELOW_PX,
                       disks_overlap: bool = False, min_seeds: int = 5):
     """One panel of the primary figure: seeds as points inside the unit cell.
 
@@ -439,7 +517,7 @@ def plot_cell_scatter(ax, df, sample: Sample, color: str, unique_below: float = 
     )
     _square_off(ax, verts)
 
-    frac = (df["r"] < unique_below).mean()
+    frac = (df["r_px"] < unique_below_px).mean()
     ax.text(0.02, 0.98, f"N = {len(df)}", transform=ax.transAxes,
             ha="left", va="top", fontsize=7, color=INK_MUTED)
     ax.text(0.5, 0.005, f"{frac:.0%} unique", transform=ax.transAxes,
@@ -462,6 +540,135 @@ def plot_ecdf(ax, runs, sample: Sample, label_null: bool = True):
     ax.set_xlim(0, None)
     ax.set_ylim(0, 1.02)
     style_axes(ax)
+
+
+def seed_of(png_path: str) -> int:
+    """Random seed a saved reconstruction figure belongs to, from its filename."""
+    import re
+
+    return int(re.search(r"_rng(\d+)_", os.path.basename(png_path)).group(1))
+
+
+def _lattice_wavevectors(window: np.ndarray, period_range=(2.2, 12.0), pad: int = 1024):
+    """The two shortest non-collinear reciprocal vectors of a fringe pattern."""
+    w = window - window.mean()
+    w = w * np.hanning(w.shape[0])[:, None] * np.hanning(w.shape[1])[None, :]
+    power = np.abs(np.fft.fftshift(np.fft.fft2(w, s=(pad, pad)))) ** 2
+    c = pad // 2
+    ky, kx = np.mgrid[:pad, :pad]
+    radius = np.hypot(ky - c, kx - c)
+    power[(radius < pad / period_range[1]) | (radius > pad / period_range[0])] = 0
+
+    found = []
+    for _ in range(12):
+        py, px = np.unravel_index(np.argmax(power), power.shape)
+        k = np.array([(px - c) / pad, (py - c) / pad])  # cycles per pixel, (kx, ky)
+        power[np.hypot(ky - py, kx - px) < pad / 60] = 0
+        power[np.hypot(ky - (2 * c - py), kx - (2 * c - px)) < pad / 60] = 0  # Friedel mate
+        if not found:
+            found.append(k)
+            continue
+        u, v = found[0] / np.linalg.norm(found[0]), k / np.linalg.norm(k)
+        if abs(u[0] * v[1] - u[1] * v[0]) > 0.3:  # not collinear with the first
+            found.append(k)
+            break
+    if len(found) < 2:
+        raise ValueError("could not find two independent lattice vectors")
+    return found
+
+
+def _lattice_phases(img, ks, band, half_window: int = 30):
+    """Phase of each fringe family, measured over a fixed window of the image."""
+    lo, hi = band
+    cy, cx = (lo + hi) // 2, img.shape[1] // 2
+    h = min(half_window, (hi - lo) // 2)
+    window = img[cy - h : cy + h, cx - half_window : cx + half_window]
+    ys, xs = np.mgrid[cy - h : cy + h, cx - half_window : cx + half_window]
+    w = window - window.mean()
+    # for w = A cos(2 pi k.r - phi), sum(w e^{-2 pi i k.r}) = (A N / 2) e^{-i phi}
+    return np.array([-np.angle(np.sum(w * np.exp(-2j * np.pi * (k[0] * xs + k[1] * ys))))
+                     for k in ks])
+
+
+def lattice_shift(img, ref, band, basis, half_window: int = 30):
+    """Displacement of a reconstruction's lattice from a reference, in object px.
+
+    Compares the phases of the same two fringe families in both images, so the
+    answer does not depend on a correlation peak being picked correctly. Like
+    every other shift here it is only defined modulo a lattice vector, and is
+    folded into the Wigner-Seitz cell.
+    """
+    lo, hi = band
+    cy = (lo + hi) // 2
+    h = min(half_window, (hi - lo) // 2)
+    ks = _lattice_wavevectors(ref[cy - h : cy + h,
+                                  ref.shape[1] // 2 - half_window : ref.shape[1] // 2 + half_window])
+    delta = _lattice_phases(img, ks, band, half_window) - _lattice_phases(ref, ks, band, half_window)
+    delta = (delta + np.pi) % (2 * np.pi) - np.pi
+    # k_i . dr = dphase_i / 2pi
+    dr = np.linalg.solve(np.stack(ks), delta / (2 * np.pi))
+    return wrap_to_cell(dr[None, :], basis)[0]
+
+
+def reference_lattice(img: np.ndarray, band, scale: float, half_window: int = 30):
+    """Column positions of a reference (unique) reconstruction, in object pixels.
+
+    Read off the reference image rather than assumed: the two dominant fringe
+    wavevectors and their phases define the lattice, so the overlay marks where
+    that run's columns actually sit, with no gaps where a local peak was missed.
+    """
+    lo, hi = band
+    cy, cx = (lo + hi) // 2, img.shape[1] // 2
+    h = min(half_window, (hi - lo) // 2)
+    window = img[cy - h : cy + h, cx - half_window : cx + half_window]
+
+    ks = _lattice_wavevectors(window)
+    ys, xs = np.mgrid[cy - h : cy + h, cx - half_window : cx + half_window]
+    w = window - window.mean()
+
+    # for w = A cos(2 pi k.r - phi), sum(w e^{-2 pi i k.r}) = (A N / 2) e^{-i phi}
+    phases = []
+    for k in ks:
+        amp = np.sum(w * np.exp(-2j * np.pi * (k[0] * xs + k[1] * ys)))
+        phases.append(-np.angle(amp))
+
+    # fringe maxima satisfy  k_i . r = n_i + phase_i / 2pi  for both i
+    matrix = np.stack(ks)
+    offs = np.array(phases) / (2 * np.pi)
+    n_max = int(np.ceil(max(img.shape) * np.linalg.norm(matrix, axis=1).max())) + 2
+    grid = np.array([[a, b] for a in range(-n_max, n_max + 1) for b in range(-n_max, n_max + 1)])
+    pts = np.linalg.solve(matrix, (grid + offs).T).T
+    keep = ((np.abs(pts[:, 0] - cx) < img.shape[1] / 2)
+            & (pts[:, 1] > lo - 2) & (pts[:, 1] < hi + 2))
+    return pts[keep]
+
+
+def plot_recon_crop(ax, img, center, half, lattice=None, color="#eb6834",
+                    marker_size: float = 30):
+    """Crop of a reconstruction, with an optional fixed reference lattice overlaid.
+
+    ``half`` is either one number or ``(half_y, half_x)``. Each crop is stretched
+    to its own percentiles: the source figures were saved with per-run colorbar
+    limits, so raw grey levels are not comparable between them.
+    """
+    cy, cx = center
+    hy, hx = (half, half) if np.isscalar(half) else half
+    crop = img[cy - hy : cy + hy, cx - hx : cx + hx]
+    lo, hi = np.percentile(crop, [2, 98])
+    # half-pixel offsets so integer pixel indices land on pixel centres, which
+    # is where the overlaid lattice coordinates live
+    ax.imshow(np.clip((crop - lo) / (hi - lo), 0, 1),
+              cmap="gray", vmin=0, vmax=1, interpolation="bilinear",
+              extent=[cx - hx - 0.5, cx + hx - 0.5, cy + hy - 0.5, cy - hy - 0.5])
+    if lattice is not None:
+        inside = ((np.abs(lattice[:, 0] - cx) < hx - 1)
+                  & (np.abs(lattice[:, 1] - cy) < hy - 1))
+        ax.scatter(lattice[inside, 0], lattice[inside, 1], s=marker_size,
+                   facecolor="none", edgecolor=color, linewidth=0.7, alpha=0.85)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_color("#d5d4d0")
 
 
 def plot_rose(ax, df, color: str, nbins: int = 16, r_min: float = 0.05):
